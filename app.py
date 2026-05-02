@@ -1,104 +1,108 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestRegressor
 import matplotlib.pyplot as plt
 import requests
+import sqlite3
+from datetime import datetime
+import time
 
-st.set_page_config(page_title="SmartLoad AI", layout="wide")
+# --- 1. DB & MODEL SETUP ---
+def init_db():
+    conn = sqlite3.connect('smartgrid_pulse.db')
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS pulse_logs 
+                 (timestamp TEXT, temp REAL, load REAL, status TEXT)''')
+    conn.commit()
+    conn.close()
 
-# 1. CSV INTEGRATION
-try:
+def log_pulse(temp, load, status):
+    conn = sqlite3.connect('smartgrid_pulse.db')
+    c = conn.cursor()
+    now = datetime.now().strftime("%H:%M:%S")
+    c.execute("INSERT INTO pulse_logs VALUES (?, ?, ?, ?)", (now, temp, load, status))
+    conn.commit()
+    conn.close()
+
+@st.cache_resource
+def train_pro_model():
     df = pd.read_csv('delhi_electricity_data.csv')
-    X = df[['temperature']]
-    y = df['demand']
-    
-    # 2. AI MODEL TRAINING
-    model = LinearRegression()
-    model.fit(X, y)
-    data_loaded = True
-except Exception as e:
-    st.error(f"CSV File Error: {e}")
-    data_loaded = False
+    model = RandomForestRegressor(n_estimators=100, random_state=42)
+    model.fit(df[['temperature']].values, df['demand'])
+    return model, df
 
-# 3. SIDEBAR SETTINGS (Advanced Features)
-st.sidebar.title("⚙️ Control Room")
-time_slot = st.sidebar.selectbox("Select Time of Day", ["Normal", "Peak (12 PM - 4 PM)", "Off-Peak (2 AM - 6 AM)"])
-heatwave_trigger = st.sidebar.button("🔥 Simulate Extreme Heatwave")
+model, historical_df = train_pro_model()
+init_db()
 
-# 4. UI LAYOUT
-st.title("⚡ SmartLoad AI: Delhi Power Predictor")
+# --- 2. UI CONFIG ---
+st.set_page_config(page_title="SmartLoad AI: Living Grid", layout="wide")
 
-if data_loaded:
-    tab1, tab2 = st.tabs(["Manual Prediction", "Live API Feed"])
+if 'live_data' not in st.session_state:
+    st.session_state.live_data = pd.DataFrame(columns=['Time', 'Load'])
 
-    with tab1:
-        st.subheader("Predict Demand based on Temp")
-        
-        # Logic for Slider or Heatwave
-        default_temp = 35
-        if heatwave_trigger:
-            temp_val = 49.5
-            st.sidebar.warning("Heatwave Mode Active!")
-        else:
-            temp_val = st.slider("Select Temperature (°C)", 20, 50, default_temp)
-        
-        # Base Prediction
-        base_prediction = model.predict([[temp_val]])[0]
-        
-        # Apply Time Multipliers
-        multiplier = 1.0
-        if "Peak" in time_slot:
-            multiplier = 1.15  # 15% extra
-        elif "Off-Peak" in time_slot:
-            multiplier = 0.80  # 20% less
+st.sidebar.title("🎮 Control Room")
+app_mode = st.sidebar.radio("Navigation", ["Live Pulse Dashboard", "Manual Stress-Test Hub", "Audit Logs"])
+api_key = st.sidebar.text_input("OpenWeather API Key", type="password")
+
+# --- 3. THE MAGIC FIX: @st.fragment ---
+# Ye decorator ensures ki sirf ye function refresh ho, pura page nahi!
+@st.fragment(run_every=5) # Har 5 second mein apne aap chalega bina flicker ke
+def live_heartbeat_ui():
+    if api_key:
+        try:
+            # Fetch & Predict
+            url = f"http://api.openweathermap.org/data/2.5/weather?q=Delhi&appid={api_key}&units=metric"
+            res = requests.get(url).json()
+            t = res['main']['temp']
+            p = model.predict([[t]])[0]
+            s = "CRITICAL" if p > 7800 else "STABLE"
             
-        final_demand = base_prediction * multiplier
-        if heatwave_trigger:
-            final_demand = final_demand * 1.10 # Extra stress for heatwave
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            st.metric("Predicted Peak Load", f"{round(final_demand, 2)} MW")
-            st.info(f"Condition: {time_slot} settings applied.")
+            # Log to DB
+            log_pulse(t, p, s)
             
-            # --- AI Recommendations Section ---
-            st.markdown("---")
-            st.subheader("💡 Smart Grid Advice")
-            if final_demand > 8000:
-                st.error("🚨 CRITICAL: High Overload Risk! Recommendation: Start rotational load shedding.")
-            elif final_demand > 6500:
-                st.warning("⚠️ ALERT: High Demand. Recommendation: Activate backup gas turbines.")
-            else:
-                st.success("✅ STABLE: Grid is operating within safety limits.")
+            # Update Session State
+            new_entry = pd.DataFrame({'Time': [datetime.now().strftime("%H:%M:%S")], 'Load': [p]})
+            st.session_state.live_data = pd.concat([st.session_state.live_data, new_entry]).tail(20)
 
-        with col2:
-            fig, ax = plt.subplots()
-            ax.scatter(X, y, color='blue', alpha=0.3, label='Past Data')
-            ax.plot(X, model.predict(X), color='red', label='AI Trend')
-            ax.scatter([temp_val], [final_demand], color='green', s=150, label='Current Point')
-            ax.set_xlabel("Temperature")
-            ax.set_ylabel("Demand (MW)")
-            ax.legend()
-            st.pyplot(fig)
+            # UI Update inside fragment
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Live Delhi Temp", f"{t}°C")
+            c2.metric("AI Prediction", f"{round(p, 2)} MW")
+            c3.metric("Grid Status", s)
 
-    with tab2:
-        st.subheader("Real-Time Data Integration")
-        api_key = st.text_input("Enter OpenWeather API Key", type="password")
-        
-        if st.button("Fetch & Predict"):
-            if api_key:
-                try:
-                    url = f"http://api.openweathermap.org/data/2.5/weather?q=Delhi&appid={api_key}&units=metric"
-                    res = requests.get(url).json()
-                    live_t = res['main']['temp']
-                    live_p = model.predict([[live_t]])[0] * multiplier
-                    
-                    st.success(f"Current Delhi Temp: {live_t}°C")
-                    st.metric("Live Predicted Demand", f"{round(live_p, 2)} MW")
-                except:
-                    st.error("API Key is invalid or not yet active.")
-            else:
-                st.warning("Please enter your API Key.")
-else:
-    st.info("Check your folder for the CSV file.")
+            st.markdown("#### Real-time Load Stream")
+            st.line_chart(st.session_state.live_data.set_index('Time'))
+            
+            st.caption(f"Last Auto-Sync: {datetime.now().strftime('%H:%M:%S')}")
+
+        except Exception as e:
+            st.error(f"Syncing... (Waiting for API response or Key)")
+    else:
+        st.warning("Enter API Key in sidebar to start the Heartbeat.")
+
+# --- 4. APP NAVIGATION ---
+if app_mode == "Live Pulse Dashboard":
+    st.title("📡 Live Grid Pulse")
+    live_heartbeat_ui() # Call the fragment
+
+elif app_mode == "Manual Stress-Test Hub":
+    st.title("🔥 Heatwave Simulation")
+    sim_t = st.slider("Select Simulation Temperature (°C)", 20.0, 50.0, 35.0)
+    if st.button("Run AI Stress Test"):
+        pred = model.predict([[sim_t]])[0]
+        st.metric("Simulated Peak Load", f"{round(pred, 2)} MW")
+        # Regression Plot
+        fig, ax = plt.subplots(facecolor='#0e1117')
+        ax.set_facecolor('#0e1117')
+        ax.tick_params(colors='white')
+        ax.scatter(historical_df['temperature'], historical_df['demand'], alpha=0.1, color='cyan')
+        ax.scatter([sim_t], [pred], color='red', s=200)
+        st.pyplot(fig)
+
+elif app_mode == "Audit Logs":
+    st.title("📋 Audit Logs")
+    conn = sqlite3.connect('smartgrid_pulse.db')
+    db_df = pd.read_sql_query("SELECT * FROM pulse_logs ORDER BY timestamp DESC", conn)
+    conn.close()
+    st.dataframe(db_df, use_container_width=True)
